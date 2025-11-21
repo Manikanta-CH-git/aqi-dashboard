@@ -75,7 +75,7 @@ def get_latest_data(limit=200):
 # 🧭 SIDEBAR
 # ==================================================
 refresh_seconds = st.sidebar.slider("⏱ Auto Refresh (Seconds)", 2, 60, 5)
-choice = st.sidebar.radio("📌 Select View", ["Current Data", "Stored Data", "Future Predictions"])
+choice = st.sidebar.radio("📌 Select View", ["Current Data", "Stored Data", "Future AQI Forecasting"])
 
 # ==================================================
 # 🟢 LIVE MONITOR
