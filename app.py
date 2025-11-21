@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from supabase import create_client, Client
+import traceback # Import traceback for detailed error logging
 
 # ==================================================
 # ☁ SUPABASE CONFIG (FROM secrets.toml)
@@ -9,7 +10,13 @@ from supabase import create_client, Client
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Initialize Supabase client
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    st.error(f"Failed to initialize Supabase client. Check secrets configuration. Error: {e}")
+    st.stop()
+
 
 # ==================================================
 # ⚙ PAGE SETTINGS
@@ -43,14 +50,25 @@ st.markdown("""
 def get_latest_data(limit=200):
     try:
         response = (
-            supabase.table("sensordata")
+            # *** CORRECTION APPLIED HERE: Changed "sensordata" to "sensor_data" ***
+            supabase.table("sensor_data")
             .select("*")
             .order("id", desc=True)
             .limit(limit)
             .execute()
         )
-        return response.data
-    except:
+        # CRITICAL CHECK: The Supabase Python client returns a NamedTuple
+        if hasattr(response, 'data') and response.data is not None:
+            return response.data
+        else:
+            st.warning("Query succeeded, but 'data' field was empty or missing from response.")
+            return []
+
+    except Exception as e:
+        # Display the error message and full traceback for debugging
+        st.error("🛑 Supabase Data Fetch Error (Check connection, RLS policies, or table schema)")
+        st.code(f"Error Type: {type(e).__name__}\nMessage: {e}\n\nTraceback:\n{traceback.format_exc()}", language="python")
+        st.caption("If RLS is disabled, this might be a network or configuration issue.")
         return []
 
 # ==================================================
@@ -67,25 +85,47 @@ def show_live_monitor():
 
     rows = get_latest_data(50)
     if not rows:
-        st.info("Waiting for data from device…")
+        st.info("Waiting for data from device, or check error message above...")
         return
 
     df = pd.DataFrame(rows)
     df.rename(columns={"created_at": "Timestamp"}, inplace=True)
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"]).dt.tz_convert("Asia/Kolkata")
+
+    # ✅ Robust timestamp parsing
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["Timestamp"])  # Remove rows that failed to parse
+    
+    # Ensure to handle the timezone conversion correctly
+    try:
+        # First localize to UTC, then convert to Asia/Kolkata
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+    except Exception:
+        # Fallback to plain timestamp if timezone conversion fails
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize(None)
+
+    if df.empty:
+        st.warning("No valid timestamp data available after cleanup.")
+        return
+
     latest = df.iloc[0]
 
-    aqi = int(latest["aqi"])
-    temp = latest["temperature"]
-    hum = latest["humidity"]
+    # Added error check for AQI conversion in case 'aqi' column is missing or non-numeric
+    try:
+        aqi = int(latest["aqi"])
+    except (ValueError, KeyError):
+        st.error("Invalid or missing AQI value found in the latest data.")
+        return
+    
+    temp = latest.get("temperature", "N/A")
+    hum = latest.get("humidity", "N/A")
 
-    # 🔵 AQI Status Logic (Correct according to your color bar)
+    # 🔵 AQI Status Logic
     if aqi <= 50: 
         status, color = "Good", "#00e400"
     elif aqi <= 100: 
         status, color = "Moderate", "#ffff00"
     elif aqi <= 150: 
-        status, color = "Poor", "#ff7e00"   # UPDATED NAME
+        status, color = "Poor", "#ff7e00"
     elif aqi <= 200: 
         status, color = "Unhealthy", "#ff0000"
     elif aqi <= 300: 
@@ -100,7 +140,8 @@ def show_live_monitor():
     col2.metric("Temperature (°C)", temp)
     col3.metric("Humidity (%)", hum)
 
-    st.caption(f"Last Updated: {latest['Timestamp'].strftime('%H:%M:%S')}")
+    # Updated timestamp format to include date
+    st.caption(f"Last Updated: {latest['Timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
 
     # 🌈 AQI BAR
     st.markdown(f"""
@@ -141,7 +182,22 @@ def show_history():
 
     df = pd.DataFrame(rows)
     df.rename(columns={"created_at": "Timestamp"}, inplace=True)
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"]).dt.tz_convert("Asia/Kolkata")
+
+    # ✅ Robust timestamp parsing
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["Timestamp"])
+    
+    # Ensure to handle the timezone conversion correctly
+    try:
+        # First localize to UTC, then convert to Asia/Kolkata
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+    except Exception:
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize(None)
+
+    if df.empty:
+        st.warning("No valid timestamp data available after cleanup.")
+        return
+
     df_sorted = df.sort_values("Timestamp")
 
     st.subheader("📈 AQI, Temperature & Humidity Trends")
@@ -149,14 +205,15 @@ def show_history():
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("📄 Data Table")
-    st.dataframe(df, use_container_width=True)
+    # Display the table with the correctly formatted timestamp
+    st.dataframe(df_sorted.set_index("Timestamp"), use_container_width=True)
 
 # ==================================================
 # 🔮 FUTURE PREDICTION
 # ==================================================
 def show_future():
     st.title("🔮 Future AQI Predictions")
-    st.info("Prediction model coming soon…")
+    st.info("Prediction model coming soon… This view is reserved for machine learning predictions based on historical data.")
 
 # ==================================================
 # ROUTING
