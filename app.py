@@ -48,15 +48,11 @@ except Exception as e:
     st.stop()
 
 # ==================================================
-# ⚡ MQTT CLIENT (THREAD-SAFE "MAILBOX" VERSION)
+# ⚡ MQTT CLIENT (THREAD-SAFE)
 # ==================================================
-# This Class holds the data safely. 
-# The background thread updates this, and Streamlit reads it.
-
 @st.cache_resource
 class MQTTService:
     def __init__(self):
-        # This variable is the "Mailbox"
         self.latest_data = {"aqi": 0, "temperature": 0, "humidity": 0, "mq135": 0}
         self.is_connected = False
         
@@ -66,7 +62,7 @@ class MQTTService:
         
         try:
             self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            self.client.loop_start() # Starts the background thread
+            self.client.loop_start()
         except Exception as e:
             print(f"MQTT Connection Failed: {e}")
 
@@ -78,15 +74,12 @@ class MQTTService:
 
     def on_message(self, client, userdata, msg):
         try:
-            # Background thread ONLY updates this variable. 
-            # It does NOT touch st.session_state directly (which causes the crash).
             payload = json.loads(msg.payload.decode())
             self.latest_data = payload
             print(f"📥 Received: {payload}") 
         except Exception as e:
             print(f"Error parsing MQTT: {e}")
 
-# Initialize the Global MQTT Service
 mqtt_service = MQTTService()
 
 # ==================================================
@@ -114,7 +107,6 @@ if "live_history" not in st.session_state:
 
 @st.fragment(run_every=1)
 def show_live_monitor():
-    # 1. Main Thread Reads from the "Mailbox" (mqtt_service.latest_data)
     data = mqtt_service.latest_data
     
     aqi = int(data.get("aqi", 0))
@@ -122,23 +114,22 @@ def show_live_monitor():
     hum = data.get("humidity", 0)
     mq135_val = data.get("mq135", 0)
 
-    # 2. Update History Graph locally in the Main Thread
-    # We do this here because ONLY the main thread is allowed to modify session_state
     current_time = datetime.now().strftime("%H:%M:%S")
     
-    # Only append if we have valid data
+    # Update history list (Only if data is valid to prevent empty graph on startup)
     if aqi > 0 or mq135_val > 0:
         st.session_state["live_history"].append({
             "Timestamp": current_time,
-            "aqi": aqi,
-            "mq135": mq135_val
+            "AQI": aqi,
+            "MQ135": mq135_val,
+            "Temperature": temp,
+            "Humidity": hum
         })
     
-    # Keep list short (last 50 seconds)
     if len(st.session_state["live_history"]) > 50:
         st.session_state["live_history"].pop(0)
 
-    # 3. Color Logic
+    # Color Logic
     if aqi <= 50: status, color = "Good", "#00e400"
     elif aqi <= 100: status, color = "Moderate", "#ffff00"
     elif aqi <= 150: status, color = "Poor", "#ff7e00"
@@ -148,9 +139,6 @@ def show_live_monitor():
 
     st.title("🌍 Live AQI Monitoring")
     
-    if not mqtt_service.is_connected:
-        st.toast("🔌 Connecting to MQTT Broker...", icon="⚠️")
-
     # 4. Metrics
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("AQI", aqi)
@@ -179,8 +167,17 @@ def show_live_monitor():
     st.subheader("📈 Live Stream (Last 50 Seconds)")
     if st.session_state["live_history"]:
         df_live = pd.DataFrame(st.session_state["live_history"])
-        fig = px.line(df_live, x="Timestamp", y=["aqi", "mq135"], markers=True)
-        st.plotly_chart(fig, use_container_width=True)
+        
+        # 🔴 Added Temperature and Humidity to the lines
+        fig = px.line(
+            df_live, 
+            x="Timestamp", 
+            y=["AQI", "MQ135", "Temperature", "Humidity"], 
+            markers=True
+        )
+        
+        # 🔴 KEY FIX: Added height=500 to stop the "Screen Jumping" issue
+        st.plotly_chart(fig, use_container_width=True, height=500, key="live_graph")
     else:
         st.info("Waiting for live data...")
 
