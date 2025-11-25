@@ -2,27 +2,42 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from supabase import create_client, Client
-import traceback
-import json
-import paho.mqtt.client as mqtt
-from datetime import datetime
-import time
+import traceback # Import traceback for detailed error logging
 
 # ==================================================
-# ⚙ PAGE SETTINGS & CSS
+# ☁ SUPABASE CONFIG (FROM secrets.toml)
+# ==================================================
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+# Initialize Supabase client
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    st.error(f"Failed to initialize Supabase client. Check secrets configuration. Error: {e}")
+    st.stop()
+
+
+# ==================================================
+# ⚙ PAGE SETTINGS
 # ==================================================
 st.set_page_config(page_title="AQI Dashboard", layout="wide")
 
+# ==================================================
+# 🌈 GLOBAL CSS
+# ==================================================
 st.markdown("""
 <style>
     .aqi-bar-container { display: flex; height: 45px; border-radius: 10px; overflow: hidden; margin-top: 10px; }
     .seg { flex: 1; text-align: center; font-weight: bold; padding-top: 12px; color: white; font-family: sans-serif; font-size: 14px; }
+
     .good { background: #00e400; }
     .moderate { background: #ffff00; color: black !important; }
     .poor { background: #ff7e00; }
     .unhealthy { background: #ff0000; }
     .veryunhealthy { background: #8f3f97; }
     .hazardous { background: #7e0023; }
+
     .ticks { width: 100%; display: flex; justify-content: space-between; margin-top: 4px; font-size: 12px; color: #aaa; }
     .big-aqi-value { font-size: 48px; font-weight: 800; text-align: center; margin-top: 15px; transition: color 0.5s ease; }
     .status-text { font-size: 24px; text-align: center; margin-bottom: 10px; font-weight: bold; }
@@ -30,125 +45,117 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==================================================
-# 📡 MQTT CONFIG
+# 📥 FETCH LATEST DATA
 # ==================================================
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_PORT = 1883
-MQTT_TOPIC = "aqi/project/smvitm_bantakal"  
-
-# ==================================================
-# ☁ SUPABASE CONFIG
-# ==================================================
-try:
-    SUPABASE_URL = st.secrets["general"]["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["general"]["SUPABASE_KEY"]
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    st.error(f"Supabase Init Error: {e}. Check secrets.toml")
-    st.stop()
-
-# ==================================================
-# ⚡ MQTT CLIENT (THREAD-SAFE)
-# ==================================================
-@st.cache_resource
-class MQTTService:
-    def __init__(self):
-        self.latest_data = {"aqi": 0, "temperature": 0, "humidity": 0, "mq135": 0}
-        self.is_connected = False
-        
-        self.client = mqtt.Client()
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message
-        
-        try:
-            self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            self.client.loop_start()
-        except Exception as e:
-            print(f"MQTT Connection Failed: {e}")
-
-    def on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            self.is_connected = True
-            print(f"✅ Connected to MQTT! Listening to: {MQTT_TOPIC}")
-            client.subscribe(MQTT_TOPIC)
-
-    def on_message(self, client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload.decode())
-            self.latest_data = payload
-            print(f"📥 Received: {payload}") 
-        except Exception as e:
-            print(f"Error parsing MQTT: {e}")
-
-mqtt_service = MQTTService()
-
-# ==================================================
-# 📥 FETCH HISTORY (Supabase)
-# ==================================================
-def get_historical_data(limit=200):
+def get_latest_data(table_name, limit=200):
     try:
-        response = supabase.table("sensor_data").select("*").order("id", desc=True).limit(limit).execute()
-        if hasattr(response, 'data') and response.data:
+        response = (
+            supabase.table(table_name)
+            .select("*")
+            .order("id", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        # CRITICAL CHECK: The Supabase Python client returns a NamedTuple
+        if hasattr(response, 'data') and response.data is not None:
             return response.data
-        return []
-    except Exception:
+        else:
+            st.warning(f"Query to {table_name} succeeded, but 'data' field was empty or missing.")
+            return []
+
+    except Exception as e:
+        # Display the error message and full traceback for debugging
+        st.error(f"🛑 Supabase Data Fetch Error from {table_name}")
+        st.code(f"Error Type: {type(e).__name__}\nMessage: {e}\n\nTraceback:\n{traceback.format_exc()}", language="python")
+        st.caption("If RLS is disabled, this might be a network or configuration issue.")
         return []
 
 # ==================================================
 # 🧭 SIDEBAR
 # ==================================================
-choice = st.sidebar.radio("📌 Select View", ["Current Data (Live)", "Stored Data (History)", "Future AQI Forecasting"])
+refresh_seconds = st.sidebar.slider("⏱ Auto Refresh (Seconds)", 2, 60, 5)
+choice = st.sidebar.radio("📌 Select View", ["Current Data", "Stored Data", "Future AQI Forecasting"])
 
 # ==================================================
-# 🟢 LIVE MONITOR VIEW
+# 🟢 LIVE MONITOR
 # ==================================================
-if "live_history" not in st.session_state:
-    st.session_state["live_history"] = []
-
-@st.fragment(run_every=1)
+@st.fragment(run_every=refresh_seconds)
 def show_live_monitor():
-    data = mqtt_service.latest_data
+    # Fetch from 'realtime_data' table for live view
+    rows = get_latest_data("realtime_data", 50)
     
-    aqi = int(data.get("aqi", 0))
-    temp = data.get("temperature", 0)
-    hum = data.get("humidity", 0)
-    mq135_val = data.get("mq135", 0)
+    if not rows:
+        st.info("Waiting for data from device (realtime_data), or check error message above...")
+        return
 
-    current_time = datetime.now().strftime("%H:%M:%S")
+    df = pd.DataFrame(rows)
     
-    # Update history list (Only if data is valid to prevent empty graph on startup)
-    if aqi > 0 or mq135_val > 0:
-        st.session_state["live_history"].append({
-            "Timestamp": current_time,
-            "AQI": aqi,
-            "MQ135": mq135_val,
-            "Temperature": temp,
-            "Humidity": hum
-        })
-    
-    if len(st.session_state["live_history"]) > 50:
-        st.session_state["live_history"].pop(0)
+    # ✅ Fix for KeyError: 'Timestamp'
+    # Check which timestamp column exists and rename it
+    if "created_at" in df.columns:
+        df.rename(columns={"created_at": "Timestamp"}, inplace=True)
+    elif "updated_at" in df.columns:
+        df.rename(columns={"updated_at": "Timestamp"}, inplace=True)
+    else:
+        st.error(f"Missing timestamp column. Available columns: {list(df.columns)}")
+        return
 
-    # Color Logic
-    if aqi <= 50: status, color = "Good", "#00e400"
-    elif aqi <= 100: status, color = "Moderate", "#ffff00"
-    elif aqi <= 150: status, color = "Poor", "#ff7e00"
-    elif aqi <= 200: status, color = "Unhealthy", "#ff0000"
-    elif aqi <= 300: status, color = "Very Unhealthy", "#8f3f97"
-    else: status, color = "Hazardous", "#7e0023"
+    # ✅ Robust timestamp parsing
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["Timestamp"])  # Remove rows that failed to parse
+    
+    # Ensure to handle the timezone conversion correctly
+    try:
+        # First localize to UTC, then convert to Asia/Kolkata
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+    except Exception:
+        # Fallback to plain timestamp if timezone conversion fails
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize(None)
+
+    if df.empty:
+        st.warning("No valid timestamp data available after cleanup.")
+        return
+
+    latest = df.iloc[0]
+
+    # Added error check for AQI conversion in case 'aqi' column is missing or non-numeric
+    try:
+        aqi = int(latest["aqi"])
+    except (ValueError, KeyError):
+        st.error("Invalid or missing AQI value found in the latest data.")
+        return
+    
+    temp = latest.get("temperature", "N/A")
+    hum = latest.get("humidity", "N/A")
+
+    # 🔵 AQI Status Logic
+    if aqi <= 50: 
+        status, color = "Good", "#00e400"
+    elif aqi <= 100: 
+        status, color = "Moderate", "#ffff00"
+    elif aqi <= 150: 
+        status, color = "Poor", "#ff7e00"
+    elif aqi <= 200: 
+        status, color = "Unhealthy", "#ff0000"
+    elif aqi <= 300: 
+        status, color = "Very Unhealthy", "#8f3f97"
+    else: 
+        status, color = "Hazardous", "#7e0023"
 
     st.title("🌍 Live AQI Monitoring")
-    
-    # 4. Metrics
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("AQI", aqi)
-    col2.metric("Temp (°C)", temp)
-    col3.metric("Humidity (%)", hum)
-    col4.metric("MQ135 (Raw)", mq135_val)
 
-    # 5. Gauge
+    col1, col2, col3 = st.columns(3)
+    col1.metric("AQI", aqi)
+    col2.metric("Temperature (°C)", temp)
+    col3.metric("Humidity (%)", hum)
+
+    # Updated timestamp format to include date
+    st.caption(f"Last Updated: {latest['Timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # 🌈 AQI BAR
     st.markdown(f"""
     <div class="status-text">Current Status: {status}</div>
+
     <div class="aqi-bar-container">
         <div class="seg good">Good</div>
         <div class="seg moderate">Moderate</div>
@@ -157,66 +164,82 @@ def show_live_monitor():
         <div class="seg veryunhealthy">Very Unhealthy</div>
         <div class="seg hazardous">Hazardous</div>
     </div>
+
     <div class="ticks">
-        <span>0</span><span>50</span><span>100</span><span>150</span><span>200</span><span>300</span><span>300+</span>
+        <span>0</span><span>50</span><span>100</span><span>150</span>
+        <span>200</span><span>300</span><span>300+</span>
     </div>
+
     <div class="big-aqi-value" style="color:{color};">{aqi} AQI</div>
     """, unsafe_allow_html=True)
 
-    # 6. Graph
-    st.subheader("📈 Live Stream (Last 50 Seconds)")
-    if st.session_state["live_history"]:
-        df_live = pd.DataFrame(st.session_state["live_history"])
-        
-        # 🔴 Added Temperature and Humidity to the lines
-        fig = px.line(
-            df_live, 
-            x="Timestamp", 
-            y=["AQI", "MQ135", "Temperature", "Humidity"], 
-            markers=True
-        )
-        
-        # 🔴 KEY FIX: Added height=500 to stop the "Screen Jumping" issue
-        st.plotly_chart(fig, use_container_width=True, height=500, key="live_graph")
-    else:
-        st.info("Waiting for live data...")
+    st.subheader("📈 Live AQI Trend")
+    df_sorted = df.sort_values("Timestamp")
+    fig = px.line(df_sorted, x="Timestamp", y="aqi", markers=True)
+    st.plotly_chart(fig, use_container_width=True)
 
 # ==================================================
-# 📁 STORED DATA VIEW
+# 📁 STORED DATA PAGE
 # ==================================================
 def show_history():
-    st.title("📊 Historical AQI Data (Hourly Averages)")
-    if st.button("🔄 Refresh Data"): st.rerun()
+    st.title("📊 Historical AQI Data")
 
-    rows = get_historical_data(1000)
+    # Fetch from 'sensor_data' table for historical view
+    rows = get_latest_data("sensor_data", 1000)
+    
     if not rows:
-        st.warning("No data in Supabase.")
+        st.warning("No data available in 'sensor_data' table.")
         return
 
     df = pd.DataFrame(rows)
-    df.rename(columns={"created_at": "Timestamp"}, inplace=True)
+    
+    # ✅ Fix for potential missing timestamp in sensor_data as well
+    if "created_at" in df.columns:
+        df.rename(columns={"created_at": "Timestamp"}, inplace=True)
+    elif "updated_at" in df.columns:
+        df.rename(columns={"updated_at": "Timestamp"}, inplace=True)
+    else:
+        st.error(f"Missing timestamp column. Available columns: {list(df.columns)}")
+        return
+
+    # ✅ Robust timestamp parsing
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["Timestamp"])
     
+    # Ensure to handle the timezone conversion correctly
     try:
-        if df["Timestamp"].dt.tz is not None:
-            df["Timestamp"] = df["Timestamp"].dt.tz_convert("Asia/Kolkata")
-        else:
-            df["Timestamp"] = df["Timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
-    except: pass
+        # First localize to UTC, then convert to Asia/Kolkata
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+    except Exception:
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize(None)
+
+    if df.empty:
+        st.warning("No valid timestamp data available after cleanup.")
+        return
 
     df_sorted = df.sort_values("Timestamp")
-    st.subheader("📈 Long-Term Trends")
+
+    st.subheader("📈 AQI, Temperature & Humidity Trends")
     fig = px.line(df_sorted, x="Timestamp", y=["aqi", "temperature", "humidity"])
     st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("📄 Data Table")
+    # Display the table with the correctly formatted timestamp
     st.dataframe(df_sorted.set_index("Timestamp"), use_container_width=True)
+
+# ==================================================
+# 🔮 FUTURE PREDICTION
+# ==================================================
+def show_future():
+    st.title("🔮 Future AQI Predictions")
+    st.info("Prediction model coming soon… This view is reserved for machine learning predictions based on historical data.")
 
 # ==================================================
 # ROUTING
 # ==================================================
-if choice == "Current Data (Live)":
+if choice == "Current Data":
     show_live_monitor()
-elif choice == "Stored Data (History)":
+elif choice == "Stored Data":
     show_history()
 elif choice == "Future AQI Forecasting":
-    st.title("🔮 Forecasting"); st.info("Coming soon...")
+    show_future()
